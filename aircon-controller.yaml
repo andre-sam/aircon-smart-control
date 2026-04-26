@@ -17,6 +17,9 @@ blueprint:
       • Solar-aware: when the optional grid-export sensor indicates surplus
         export above a threshold, the effective target is shifted to
         pre-cool / pre-heat more aggressively (free energy).
+      • Time-of-use tariff awareness: avoid starting (or even running)
+        units during peak rate, with a smaller offset during shoulder.
+        Solar surplus overrides the lockout.
       • Master enable toggle (input_boolean).
       • Optional notifications when the controller turns units on/off.
 
@@ -81,6 +84,48 @@ blueprint:
           min: 0.1
           max: 3.0
           step: 0.1
+          unit_of_measurement: "°C"
+
+    adaptive_hysteresis_max:
+      name: Adaptive hysteresis — max extra (°C)
+      description: >
+        Extra hysteresis added on top of the base value when the outdoor
+        temperature is far from the target (heavy thermal load → the room
+        heats/cools back fast, so a wider deadband prevents cycling).
+        Requires the outdoor temperature sensor. Set 0 to disable.
+      default: 1.0
+      selector:
+        number:
+          min: 0
+          max: 3
+          step: 0.1
+          unit_of_measurement: "°C"
+
+    adaptive_hysteresis_soft_delta:
+      name: Adaptive hysteresis — soft delta (°C)
+      description: >
+        Outdoor-vs-target delta at which the boost STARTS ramping up
+        from 0. Below this delta the base hysteresis is used unchanged.
+      default: 8.0
+      selector:
+        number:
+          min: 1
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+
+    adaptive_hysteresis_hard_delta:
+      name: Adaptive hysteresis — hard delta (°C)
+      description: >
+        Outdoor-vs-target delta at which the boost reaches its MAXIMUM
+        (`adaptive_hysteresis_max`). Between soft and hard deltas the
+        boost is interpolated linearly.
+      default: 15.0
+      selector:
+        number:
+          min: 2
+          max: 40
+          step: 0.5
           unit_of_measurement: "°C"
 
     min_runtime_minutes:
@@ -316,6 +361,101 @@ blueprint:
           step: 0.5
           unit_of_measurement: "°C"
 
+    # ---------------- time-of-use tariff (optional) ----------------
+    tariff_sensor:
+      name: Tariff sensor (optional)
+      description: >
+        An entity whose state is one of `peak`, `shoulder`, `off_peak`
+        (case-insensitive; `offpeak`/`off-peak` also accepted). Can be a
+        `sensor`, `select`, or `input_select` (e.g. `select.daily_energy`).
+        When present, this overrides the time-window settings below.
+      default: ""
+      selector:
+        entity:
+          domain:
+            - sensor
+            - select
+            - input_select
+
+    peak_start:
+      name: Peak — start time (fallback)
+      description: >
+        Used only when no tariff sensor is configured. Defines the daily
+        peak window. Set start = end to disable.
+      default: "15:00:00"
+      selector:
+        time: {}
+
+    peak_end:
+      name: Peak — end time (fallback)
+      default: "21:00:00"
+      selector:
+        time: {}
+
+    shoulder_start:
+      name: Shoulder — start time (fallback)
+      description: >
+        Optional shoulder window (lighter restriction than peak). Set
+        start = end to disable. Ignored if a tariff sensor is configured.
+      default: "07:00:00"
+      selector:
+        time: {}
+
+    shoulder_end:
+      name: Shoulder — end time (fallback)
+      default: "15:00:00"
+      selector:
+        time: {}
+
+    peak_avoid_mode:
+      name: Peak avoidance behaviour
+      description: >
+        How to react during PEAK rates:
+          • ignore — do nothing.
+          • lockout — do not start units during peak (already-running
+            units keep running until they hit target). Solar surplus
+            overrides the lockout.
+          • lockout_and_drift — lockout PLUS shift the effective target
+            by `peak_target_offset` so already-running units cycle off
+            sooner.
+          • force_off — turn all units OFF during peak (solar surplus
+            overrides).
+      default: lockout_and_drift
+      selector:
+        select:
+          options:
+            - ignore
+            - lockout
+            - lockout_and_drift
+            - force_off
+
+    peak_target_offset:
+      name: Peak target offset (°C)
+      description: >
+        While in peak rate, shift the effective target by this many °C
+        in the comfort-relaxing direction (warmer while cooling, cooler
+        while heating). Used by `lockout_and_drift`.
+      default: 1.5
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.5
+          unit_of_measurement: "°C"
+
+    shoulder_target_offset:
+      name: Shoulder target offset (°C)
+      description: >
+        While in shoulder rate, shift the effective target by this many
+        °C (smaller than peak). Set 0 to disable.
+      default: 0.5
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.5
+          unit_of_measurement: "°C"
+
     # ---------------- notifications ----------------
     notify_service:
       name: Notification service (optional)
@@ -334,6 +474,9 @@ variables:
   enable_toggle: !input enable_toggle
   target_temp_entity: !input target_temp
   hysteresis: !input hysteresis
+  adaptive_hysteresis_max: !input adaptive_hysteresis_max
+  adaptive_hysteresis_soft_delta: !input adaptive_hysteresis_soft_delta
+  adaptive_hysteresis_hard_delta: !input adaptive_hysteresis_hard_delta
   min_runtime_minutes: !input min_runtime_minutes
   mode_strategy: !input mode_strategy
   outdoor_temp_sensor: !input outdoor_temp_sensor
@@ -352,6 +495,14 @@ variables:
   solar_positive_when_exporting: !input solar_positive_when_exporting
   solar_export_threshold: !input solar_export_threshold
   solar_boost_offset: !input solar_boost_offset
+  tariff_sensor: !input tariff_sensor
+  peak_start: !input peak_start
+  peak_end: !input peak_end
+  shoulder_start: !input shoulder_start
+  shoulder_end: !input shoulder_end
+  peak_avoid_mode: !input peak_avoid_mode
+  peak_target_offset: !input peak_target_offset
+  shoulder_target_offset: !input shoulder_target_offset
   notify_service: !input notify_service
 
   # ---- derived state (recomputed on every trigger) ----
@@ -407,6 +558,39 @@ variables:
         {{ (-v) >= solar_export_threshold }}
       {% endif %}
     {% endif %}
+
+  # ToU tariff: prefer the sensor; otherwise fall back to time windows.
+  tariff: >
+    {% if tariff_sensor not in [none, ''] %}
+      {% set s = states(tariff_sensor) | lower | replace('-', '_') | replace(' ', '_') %}
+      {% if s in ['peak'] %}
+        peak
+      {% elif s in ['shoulder'] %}
+        shoulder
+      {% elif s in ['off_peak','offpeak'] %}
+        off_peak
+      {% else %}
+        unknown
+      {% endif %}
+    {% else %}
+      {% set n = now() %}
+      {% set ps = today_at(peak_start) %}
+      {% set pe = today_at(peak_end) %}
+      {% set ss = today_at(shoulder_start) %}
+      {% set se = today_at(shoulder_end) %}
+      {% set in_peak = (ps != pe) and ((ps < pe and ps <= n < pe) or (ps > pe and (n >= ps or n < pe))) %}
+      {% set in_shoulder = (ss != se) and ((ss < se and ss <= n < se) or (ss > se and (n >= ss or n < se))) %}
+      {% if in_peak %}
+        peak
+      {% elif in_shoulder %}
+        shoulder
+      {% else %}
+        off_peak
+      {% endif %}
+    {% endif %}
+
+  in_peak: "{{ tariff == 'peak' }}"
+  in_shoulder: "{{ tariff == 'shoulder' }}"
 
 trigger:
   - platform: time_pattern
@@ -504,6 +688,29 @@ action:
                             message: >
                               Aircon: end of schedule — turned off {{ repeat.item }}.
 
+      # Peak tariff with `force_off` mode → force off (unless solar surplus).
+      - conditions:
+          - "{{ in_peak }}"
+          - "{{ peak_avoid_mode == 'force_off' }}"
+          - "{{ not solar_exporting }}"
+        sequence:
+          - repeat:
+              for_each: "{{ climate_entities }}"
+              sequence:
+                - if:
+                    - "{{ not is_state(repeat.item, 'off') }}"
+                  then:
+                    - service: climate.turn_off
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                    - if:
+                        - "{{ notify_service not in [none, ''] }}"
+                      then:
+                        - service: "{{ notify_service }}"
+                          data:
+                            message: >
+                              Aircon: peak tariff — turned off {{ repeat.item }}.
+
     # ------------------------------------------------------------------
     # Default branch: enabled + in-schedule.
     # Per-entity decision: choose mode, compute effective target, decide
@@ -599,18 +806,51 @@ action:
                     {% else %}
                       {% set raw = t + solar_boost_offset %}
                     {% endif %}
+                  {% else %}
+                    {# Tariff-based comfort-relaxing offset (ignored when
+                       exporting solar — free energy beats grid cost). #}
+                    {% set ofs = 0 %}
+                    {% if in_peak and peak_avoid_mode in ['lockout_and_drift'] %}
+                      {% set ofs = peak_target_offset %}
+                    {% elif in_shoulder %}
+                      {% set ofs = shoulder_target_offset %}
+                    {% endif %}
+                    {% if desired_mode in ['cool','dry'] %}
+                      {% set raw = t + ofs %}
+                    {% else %}
+                      {% set raw = t - ofs %}
+                    {% endif %}
                   {% endif %}
                   {# Clamp against the climate entity's supported range. #}
                   {% set mn = state_attr(ent, 'min_temp') | float(default=16) %}
                   {% set mx = state_attr(ent, 'max_temp') | float(default=30) %}
                   {{ ([mn, [raw, mx] | min] | max) | round(1) }}
+                # Adaptive hysteresis: widen the deadband when the outdoor
+                # temperature is far from the target (heavy thermal load).
+                hys: >
+                  {% set base = hysteresis %}
+                  {% if adaptive_hysteresis_max == 0 or outdoor_temp is none %}
+                    {{ base }}
+                  {% else %}
+                    {% set delta = (outdoor_temp - target_base) | abs %}
+                    {% set soft = adaptive_hysteresis_soft_delta %}
+                    {% set hard = adaptive_hysteresis_hard_delta %}
+                    {% if delta <= soft or hard <= soft %}
+                      {{ base }}
+                    {% elif delta >= hard %}
+                      {{ (base + adaptive_hysteresis_max) | round(2) }}
+                    {% else %}
+                      {% set frac = (delta - soft) / (hard - soft) %}
+                      {{ (base + adaptive_hysteresis_max * frac) | round(2) }}
+                    {% endif %}
+                  {% endif %}
                 should_be_on: >
                   {% if cur_temp is none %}
                     false
                   {% elif desired_mode in ['cool','dry'] %}
-                    {{ cur_temp > (effective_target + hysteresis) }}
+                    {{ cur_temp > (effective_target + hys) }}
                   {% elif desired_mode == 'heat' %}
-                    {{ cur_temp < (effective_target - hysteresis) }}
+                    {{ cur_temp < (effective_target - hys) }}
                   {% else %}
                     false
                   {% endif %}
@@ -618,9 +858,9 @@ action:
                   {% if cur_temp is none %}
                     false
                   {% elif desired_mode in ['cool','dry'] %}
-                    {{ cur_temp < (effective_target - hysteresis) }}
+                    {{ cur_temp < (effective_target - hys) }}
                   {% elif desired_mode == 'heat' %}
-                    {{ cur_temp > (effective_target + hysteresis) }}
+                    {{ cur_temp > (effective_target + hys) }}
                   {% else %}
                     false
                   {% endif %}
@@ -631,6 +871,51 @@ action:
                 - conditions:
                     - "{{ cur_temp is none }}"
                   sequence: []
+
+                # Currently OFF and should turn ON.
+                # Peak lockout: if `lockout`/`lockout_and_drift` is active and
+                # we are in peak without solar surplus, do NOT start the unit.
+                - conditions:
+                    - "{{ not is_on }}"
+                    - "{{ should_be_on }}"
+                    - "{{ in_peak }}"
+                    - "{{ peak_avoid_mode in ['lockout','lockout_and_drift'] }}"
+                    - "{{ not solar_exporting }}"
+                  sequence: []
+
+                # Solar-aware fan-only: room is at target, but we're exporting
+                # surplus solar — circulate air for free instead of doing nothing.
+                - conditions:
+                    - "{{ not is_on }}"
+                    - "{{ not should_be_on }}"
+                    - "{{ solar_exporting }}"
+                    - "{{ desired_mode in ['cool','dry'] }}"
+                    - "{{ 'fan_only' in supported_modes }}"
+                  sequence:
+                    - service: climate.set_hvac_mode
+                      target:
+                        entity_id: "{{ ent }}"
+                      data:
+                        hvac_mode: fan_only
+                    - if:
+                        - "{{ notify_service not in [none, ''] }}"
+                      then:
+                        - service: "{{ notify_service }}"
+                          data:
+                            message: >
+                              Aircon: {{ ent }} → fan only (solar surplus,
+                              room {{ cur_temp }}°C at target).
+
+                # Stop fan-only when solar surplus disappears and the room
+                # doesn't actually need cooling/heating.
+                - conditions:
+                    - "{{ hvac_mode == 'fan_only' }}"
+                    - "{{ not solar_exporting }}"
+                    - "{{ not should_be_on }}"
+                  sequence:
+                    - service: climate.turn_off
+                      target:
+                        entity_id: "{{ ent }}"
 
                 # Currently OFF and should turn ON.
                 - conditions:
