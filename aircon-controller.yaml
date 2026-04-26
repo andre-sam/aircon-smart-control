@@ -125,9 +125,10 @@ blueprint:
       name: Season sensor (optional)
       description: >
         A sensor whose state is one of `winter`, `spring`, `summer`,
-        `autumn`/`fall`. Defaults to the built-in `sensor.season` from the
-        Season integration. Used only when `mode_strategy = auto_season`.
-      default: sensor.season
+        `autumn`/`fall`. Typically `sensor.season` from the Season
+        integration (must be installed separately). Used only when
+        `mode_strategy = auto_season`. Leave empty to disable.
+      default: ""
       selector:
         entity:
           domain: sensor
@@ -362,14 +363,15 @@ variables:
   now_t: "{{ now().strftime('%H:%M:%S') }}"
 
   in_schedule: >
-    {% set s = schedule_start %}
-    {% set e = schedule_end %}
-    {% set n = now_t %}
+    {% set s = today_at(schedule_start) %}
+    {% set e = today_at(schedule_end) %}
+    {% set n = now() %}
     {% if s == e %}
       true
     {% elif s < e %}
       {{ s <= n < e }}
     {% else %}
+      {# Overnight window (e.g. 22:00 → 06:00). #}
       {{ n >= s or n < e }}
     {% endif %}
 
@@ -425,6 +427,8 @@ condition: []
 action:
   # ------------------------------------------------------------------
   # Fetch today's forecast once per tick (shared across all entities).
+  # `continue_on_error` so a flaky weather integration cannot break the
+  # whole controller — forecast vars just fall back to None.
   # ------------------------------------------------------------------
   - if:
       - "{{ weather_entity not in [none, ''] }}"
@@ -435,6 +439,7 @@ action:
         data:
           type: daily
         response_variable: forecast_resp
+        continue_on_error: true
   - variables:
       forecast_today: >
         {% if weather_entity not in [none, ''] and forecast_resp is defined %}
@@ -517,6 +522,7 @@ action:
                     {{ state_attr(ent, 'current_temperature') | float(default=None) }}
                   {% endif %}
                 hvac_mode: "{{ states(ent) }}"
+                supported_modes: "{{ state_attr(ent, 'hvac_modes') | default([]) }}"
                 last_changed_min: >
                   {% set lc = states[ent].last_changed if states[ent] else None %}
                   {% if lc %}
@@ -572,25 +578,32 @@ action:
                       {{ 'cool' if cur_temp >= t else 'heat' }}
                     {% endif %}
                   {% endif %}
-                # Humidity override: if cooling and the room is muggy, use `dry`.
+                # Humidity override: if cooling and the room is muggy, use `dry`
+                # — but only if the unit actually supports `dry`.
                 desired_mode: >
                   {% set bm = base_mode | trim %}
-                  {% if bm == 'cool' and room_humidity is not none and room_humidity >= humidity_dry_threshold %}
+                  {% if bm == 'cool'
+                        and room_humidity is not none
+                        and room_humidity >= humidity_dry_threshold
+                        and 'dry' in supported_modes %}
                     dry
                   {% else %}
                     {{ bm }}
                   {% endif %}
                 effective_target: >
                   {% set t = target_base %}
+                  {% set raw = t %}
                   {% if solar_exporting %}
                     {% if desired_mode in ['cool','dry'] %}
-                      {{ (t - solar_boost_offset) | round(1) }}
+                      {% set raw = t - solar_boost_offset %}
                     {% else %}
-                      {{ (t + solar_boost_offset) | round(1) }}
+                      {% set raw = t + solar_boost_offset %}
                     {% endif %}
-                  {% else %}
-                    {{ t }}
                   {% endif %}
+                  {# Clamp against the climate entity's supported range. #}
+                  {% set mn = state_attr(ent, 'min_temp') | float(default=16) %}
+                  {% set mx = state_attr(ent, 'max_temp') | float(default=30) %}
+                  {{ ([mn, [raw, mx] | min] | max) | round(1) }}
                 should_be_on: >
                   {% if cur_temp is none %}
                     false
@@ -644,6 +657,33 @@ action:
                               {{ effective_target }}°C
                               (room {{ cur_temp }}°C, target {{ target_base }}°C
                               {% if solar_exporting %}, solar boost{% endif %}).
+
+                # Currently ON and should turn OFF — respecting min runtime.
+                # In COOL mode, prefer dropping to `fan_only` (if supported)
+                # for circulation rather than fully powering down.
+                - conditions:
+                    - "{{ is_on }}"
+                    - "{{ should_be_off }}"
+                    - "{{ last_changed_min >= min_runtime_minutes }}"
+                    - "{{ desired_mode == 'cool' }}"
+                    - "{{ 'fan_only' in supported_modes }}"
+                  sequence:
+                    - if:
+                        - "{{ hvac_mode != 'fan_only' }}"
+                      then:
+                        - service: climate.set_hvac_mode
+                          target:
+                            entity_id: "{{ ent }}"
+                          data:
+                            hvac_mode: fan_only
+                        - if:
+                            - "{{ notify_service not in [none, ''] }}"
+                          then:
+                            - service: "{{ notify_service }}"
+                              data:
+                                message: >
+                                  Aircon: {{ ent }} reached target
+                                  ({{ cur_temp }}°C vs {{ effective_target }}°C) — fan only.
 
                 # Currently ON and should turn OFF — respecting min runtime.
                 - conditions:
