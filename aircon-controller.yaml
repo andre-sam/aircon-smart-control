@@ -1,0 +1,532 @@
+blueprint:
+  name: Aircon Smart Controller (Mitsubishi / ECHONETlite)
+  description: >
+    Smart climate controller for one or more `climate.*` entities (designed
+    around Mitsubishi units exposed via the ECHONETlite integration, but works
+    with any climate entity that supports `set_temperature`, `set_hvac_mode`,
+    and reports `current_temperature`).
+
+
+    Features:
+      • Maintains a target temperature with configurable hysteresis and a
+        minimum runtime to avoid short-cycling.
+      • Auto-selects cool / heat mode based on indoor (or optional outdoor)
+        temperature vs. target.
+      • Time-of-day schedule: only operates between `start_time` and
+        `end_time`. Outside the window, units are turned off.
+      • Quiet hours: during this window, units stay in their current state
+        (no on/off transitions, but target setpoint is still maintained).
+      • Window / door open detection: pauses (turns off) any time the
+        provided binary_sensor group reports `on`.
+      • Solar-aware: when the optional grid-export sensor indicates surplus
+        export above a threshold, the effective target is shifted to
+        pre-cool / pre-heat more aggressively (free energy).
+      • Master enable toggle (input_boolean).
+      • Optional notifications when the controller turns units on/off.
+
+
+    Designed to apply the SAME logic to every entity in the list. Run the
+    automation every minute via the built-in time trigger, plus on relevant
+    state changes.
+
+
+    Required helpers (create these first):
+      • input_boolean for the master enable toggle
+      • input_number for the target temperature (recommended) OR pick a
+        fixed value in the blueprint
+      • (optional) binary_sensor / group of window+door sensors
+      • (optional) sensor for outdoor temperature
+      • (optional) sensor for grid export power (negative when exporting,
+        OR positive with the "positive_when_exporting" toggle)
+
+
+  domain: automation
+  source_url: https://github.com/andre-sam/aircon-smart-control/blob/main/aircon-controller.yaml
+
+  input:
+    climate_entities:
+      name: Climate entities
+      description: One or more `climate.*` entities to control with the same logic.
+      selector:
+        entity:
+          domain: climate
+          multiple: true
+
+    enable_toggle:
+      name: Master enable toggle
+      description: input_boolean to enable/disable the whole automation.
+      selector:
+        entity:
+          domain: input_boolean
+
+    target_temp:
+      name: Target temperature (helper)
+      description: >
+        An `input_number` representing the desired room temperature (°C).
+        Recommended over hard-coding a value so you can tweak it from the UI.
+      selector:
+        entity:
+          domain: input_number
+
+    hysteresis:
+      name: Hysteresis (°C)
+      description: >
+        Deadband around the target. Cooling turns ON at
+        `target + hysteresis` and OFF at `target - hysteresis`. Heating is
+        the mirror image. Keeps the unit from cycling on tiny fluctuations.
+      default: 0.5
+      selector:
+        number:
+          min: 0.1
+          max: 3.0
+          step: 0.1
+          unit_of_measurement: "°C"
+
+    min_runtime_minutes:
+      name: Minimum runtime (minutes)
+      description: >
+        Once a unit is turned ON, it will not be turned OFF again for at
+        least this many minutes (protects the compressor and reduces wear).
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          unit_of_measurement: "min"
+
+    # ---------------- mode selection ----------------
+    mode_strategy:
+      name: HVAC mode strategy
+      description: >
+        How to choose between cool and heat.
+          • auto_indoor — pick `cool` if indoor > target, `heat` if indoor < target.
+          • auto_outdoor — same, but use the outdoor temperature sensor.
+          • cool_only — never heat.
+          • heat_only — never cool.
+          • follow_climate — leave whatever HVAC mode is set on the entity.
+      default: auto_indoor
+      selector:
+        select:
+          options:
+            - auto_indoor
+            - auto_outdoor
+            - cool_only
+            - heat_only
+            - follow_climate
+
+    outdoor_temp_sensor:
+      name: Outdoor temperature sensor (optional)
+      description: Required only if `mode_strategy = auto_outdoor`.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+
+    # ---------------- schedule ----------------
+    schedule_start:
+      name: Schedule — start time
+      description: Earliest time of day the controller is allowed to run units.
+      default: "06:00:00"
+      selector:
+        time: {}
+
+    schedule_end:
+      name: Schedule — end time
+      description: >
+        Latest time of day the controller is allowed to run units. Outside
+        the window all controlled units are turned OFF.
+      default: "23:00:00"
+      selector:
+        time: {}
+
+    # ---------------- quiet hours ----------------
+    quiet_start:
+      name: Quiet hours — start
+      description: >
+        During quiet hours the controller will not turn units ON or OFF
+        (it will still update the target temperature on units that are
+        already running). Set start = end to disable.
+      default: "22:00:00"
+      selector:
+        time: {}
+
+    quiet_end:
+      name: Quiet hours — end
+      default: "06:00:00"
+      selector:
+        time: {}
+
+    # ---------------- window / door pause ----------------
+    window_sensor:
+      name: Window / door open sensor (optional)
+      description: >
+        A `binary_sensor` (typically a group of window+door contacts). When
+        ON, all controlled units are turned OFF and held off until it is
+        OFF again. Leave empty to disable.
+      default: ""
+      selector:
+        entity:
+          domain: binary_sensor
+
+    # ---------------- solar awareness ----------------
+    solar_export_sensor:
+      name: Grid export power sensor (optional)
+      description: >
+        Sensor reporting power exported to grid. By default expects a SIGNED
+        net sensor that goes NEGATIVE when exporting (most common). Use the
+        toggle below if your sensor is positive when exporting.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+
+    solar_positive_when_exporting:
+      name: Solar sensor is positive when exporting
+      description: >
+        Enable if your sensor reports a positive value while exporting
+        (e.g. an export-only counter). Leave OFF for a signed net sensor
+        that goes negative when exporting.
+      default: false
+      selector:
+        boolean: {}
+
+    solar_export_threshold:
+      name: Solar export threshold (W)
+      description: >
+        Minimum surplus export, in watts, before the "solar boost" target
+        offset is applied.
+      default: 1500
+      selector:
+        number:
+          min: 0
+          max: 10000
+          step: 100
+          unit_of_measurement: "W"
+
+    solar_boost_offset:
+      name: Solar boost target offset (°C)
+      description: >
+        While exporting above the threshold, the effective target is shifted
+        by this many °C in the direction of more cooling / heating (i.e.
+        cooler target while cooling, warmer target while heating). Set 0 to
+        disable solar awareness.
+      default: 1.0
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.5
+          unit_of_measurement: "°C"
+
+    # ---------------- notifications ----------------
+    notify_service:
+      name: Notification service (optional)
+      description: >
+        Service name to call when units turn on/off, e.g.
+        `notify.mobile_app_my_phone`. Leave blank to disable notifications.
+      default: ""
+      selector:
+        text: {}
+
+mode: single
+max_exceeded: silent
+
+variables:
+  climate_entities: !input climate_entities
+  enable_toggle: !input enable_toggle
+  target_temp_entity: !input target_temp
+  hysteresis: !input hysteresis
+  min_runtime_minutes: !input min_runtime_minutes
+  mode_strategy: !input mode_strategy
+  outdoor_temp_sensor: !input outdoor_temp_sensor
+  schedule_start: !input schedule_start
+  schedule_end: !input schedule_end
+  quiet_start: !input quiet_start
+  quiet_end: !input quiet_end
+  window_sensor: !input window_sensor
+  solar_export_sensor: !input solar_export_sensor
+  solar_positive_when_exporting: !input solar_positive_when_exporting
+  solar_export_threshold: !input solar_export_threshold
+  solar_boost_offset: !input solar_boost_offset
+  notify_service: !input notify_service
+
+  # ---- derived state (recomputed on every trigger) ----
+  enabled: "{{ is_state(enable_toggle, 'on') }}"
+
+  target_base: >
+    {{ states(target_temp_entity) | float(default=23) }}
+
+  now_t: "{{ now().strftime('%H:%M:%S') }}"
+
+  in_schedule: >
+    {% set s = schedule_start %}
+    {% set e = schedule_end %}
+    {% set n = now_t %}
+    {% if s == e %}
+      true
+    {% elif s < e %}
+      {{ s <= n < e }}
+    {% else %}
+      {{ n >= s or n < e }}
+    {% endif %}
+
+  in_quiet: >
+    {% set s = quiet_start %}
+    {% set e = quiet_end %}
+    {% set n = now_t %}
+    {% if s == e %}
+      false
+    {% elif s < e %}
+      {{ s <= n < e }}
+    {% else %}
+      {{ n >= s or n < e }}
+    {% endif %}
+
+  window_open: >
+    {{ window_sensor not in [none, ''] and is_state(window_sensor, 'on') }}
+
+  outdoor_temp: >
+    {% if outdoor_temp_sensor not in [none, ''] %}
+      {{ states(outdoor_temp_sensor) | float(default=None) }}
+    {% else %}
+      None
+    {% endif %}
+
+  solar_exporting: >
+    {% if solar_export_sensor in [none, ''] or solar_boost_offset == 0 %}
+      false
+    {% else %}
+      {% set v = states(solar_export_sensor) | float(default=0) %}
+      {% if solar_positive_when_exporting %}
+        {{ v >= solar_export_threshold }}
+      {% else %}
+        {{ (-v) >= solar_export_threshold }}
+      {% endif %}
+    {% endif %}
+
+trigger:
+  - platform: time_pattern
+    minutes: "/1"
+    id: tick
+  - platform: state
+    entity_id: !input enable_toggle
+    id: toggle
+  - platform: time
+    at: !input schedule_start
+    id: schedule_start
+  - platform: time
+    at: !input schedule_end
+    id: schedule_end
+
+condition: []
+
+action:
+  # ------------------------------------------------------------------
+  # Hard OFF cases — applied to all entities, regardless of quiet hours.
+  # Order matters: window > disabled > out-of-schedule.
+  # ------------------------------------------------------------------
+  - choose:
+      # Window/door open → force off
+      - conditions:
+          - "{{ window_open }}"
+        sequence:
+          - repeat:
+              for_each: "{{ climate_entities }}"
+              sequence:
+                - if:
+                    - "{{ not is_state(repeat.item, 'off') }}"
+                  then:
+                    - service: climate.turn_off
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                    - if:
+                        - "{{ notify_service not in [none, ''] }}"
+                      then:
+                        - service: "{{ notify_service }}"
+                          data:
+                            message: >
+                              Aircon: turned off {{ repeat.item }} — window/door open.
+
+      # Master toggle off → force off
+      - conditions:
+          - "{{ not enabled }}"
+        sequence:
+          - repeat:
+              for_each: "{{ climate_entities }}"
+              sequence:
+                - if:
+                    - "{{ not is_state(repeat.item, 'off') }}"
+                  then:
+                    - service: climate.turn_off
+                      target:
+                        entity_id: "{{ repeat.item }}"
+
+      # Outside schedule → force off
+      - conditions:
+          - "{{ not in_schedule }}"
+        sequence:
+          - repeat:
+              for_each: "{{ climate_entities }}"
+              sequence:
+                - if:
+                    - "{{ not is_state(repeat.item, 'off') }}"
+                  then:
+                    - service: climate.turn_off
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                    - if:
+                        - "{{ notify_service not in [none, ''] }}"
+                      then:
+                        - service: "{{ notify_service }}"
+                          data:
+                            message: >
+                              Aircon: end of schedule — turned off {{ repeat.item }}.
+
+    # ------------------------------------------------------------------
+    # Default branch: enabled + in-schedule + window closed.
+    # Per-entity decision: choose mode, compute effective target, decide
+    # turn on / turn off / just adjust setpoint.
+    # ------------------------------------------------------------------
+    default:
+      - repeat:
+          for_each: "{{ climate_entities }}"
+          sequence:
+            - variables:
+                ent: "{{ repeat.item }}"
+                cur_temp: >
+                  {{ state_attr(ent, 'current_temperature') | float(default=None) }}
+                hvac_mode: "{{ states(ent) }}"
+                last_changed_min: >
+                  {% set lc = states[ent].last_changed if states[ent] else None %}
+                  {% if lc %}
+                    {{ ((now() - lc).total_seconds() / 60) | round(1) }}
+                  {% else %}
+                    9999
+                  {% endif %}
+                # Decide desired direction (cool / heat) using the strategy.
+                desired_mode: >
+                  {% set t = target_base %}
+                  {% if mode_strategy == 'cool_only' %}
+                    cool
+                  {% elif mode_strategy == 'heat_only' %}
+                    heat
+                  {% elif mode_strategy == 'follow_climate' %}
+                    {{ hvac_mode if hvac_mode in ['cool','heat','heat_cool','dry','fan_only'] else 'cool' }}
+                  {% elif mode_strategy == 'auto_outdoor' and outdoor_temp is not none %}
+                    {{ 'cool' if outdoor_temp >= t else 'heat' }}
+                  {% else %}
+                    {% if cur_temp is none %}
+                      cool
+                    {% else %}
+                      {{ 'cool' if cur_temp >= t else 'heat' }}
+                    {% endif %}
+                  {% endif %}
+                effective_target: >
+                  {% set t = target_base %}
+                  {% if solar_exporting %}
+                    {% if desired_mode == 'cool' %}
+                      {{ (t - solar_boost_offset) | round(1) }}
+                    {% else %}
+                      {{ (t + solar_boost_offset) | round(1) }}
+                    {% endif %}
+                  {% else %}
+                    {{ t }}
+                  {% endif %}
+                should_be_on: >
+                  {% if cur_temp is none %}
+                    false
+                  {% elif desired_mode == 'cool' %}
+                    {{ cur_temp > (effective_target + hysteresis) }}
+                  {% elif desired_mode == 'heat' %}
+                    {{ cur_temp < (effective_target - hysteresis) }}
+                  {% else %}
+                    false
+                  {% endif %}
+                should_be_off: >
+                  {% if cur_temp is none %}
+                    false
+                  {% elif desired_mode == 'cool' %}
+                    {{ cur_temp < (effective_target - hysteresis) }}
+                  {% elif desired_mode == 'heat' %}
+                    {{ cur_temp > (effective_target + hysteresis) }}
+                  {% else %}
+                    false
+                  {% endif %}
+                is_on: "{{ hvac_mode != 'off' and hvac_mode != 'unavailable' }}"
+
+            - choose:
+                # Skipped if entity is unavailable / has no current_temperature.
+                - conditions:
+                    - "{{ cur_temp is none }}"
+                  sequence: []
+
+                # Currently OFF and should turn ON — unless quiet hours.
+                - conditions:
+                    - "{{ not is_on }}"
+                    - "{{ should_be_on }}"
+                    - "{{ not in_quiet }}"
+                  sequence:
+                    - service: climate.set_hvac_mode
+                      target:
+                        entity_id: "{{ ent }}"
+                      data:
+                        hvac_mode: "{{ desired_mode }}"
+                    - service: climate.set_temperature
+                      target:
+                        entity_id: "{{ ent }}"
+                      data:
+                        temperature: "{{ effective_target }}"
+                    - if:
+                        - "{{ notify_service not in [none, ''] }}"
+                      then:
+                        - service: "{{ notify_service }}"
+                          data:
+                            message: >
+                              Aircon: {{ ent }} → {{ desired_mode }} @
+                              {{ effective_target }}°C
+                              (room {{ cur_temp }}°C, target {{ target_base }}°C
+                              {% if solar_exporting %}, solar boost{% endif %}).
+
+                # Currently ON and should turn OFF — respecting min runtime
+                # and quiet hours.
+                - conditions:
+                    - "{{ is_on }}"
+                    - "{{ should_be_off }}"
+                    - "{{ not in_quiet }}"
+                    - "{{ last_changed_min >= min_runtime_minutes }}"
+                  sequence:
+                    - service: climate.turn_off
+                      target:
+                        entity_id: "{{ ent }}"
+                    - if:
+                        - "{{ notify_service not in [none, ''] }}"
+                      then:
+                        - service: "{{ notify_service }}"
+                          data:
+                            message: >
+                              Aircon: {{ ent }} reached target
+                              ({{ cur_temp }}°C vs {{ effective_target }}°C) — off.
+
+                # Currently ON, mode/setpoint may need updating (e.g. solar
+                # boost just kicked in, or target_temp helper changed).
+                - conditions:
+                    - "{{ is_on }}"
+                  sequence:
+                    - if:
+                        - "{{ mode_strategy != 'follow_climate' }}"
+                        - "{{ hvac_mode != desired_mode }}"
+                        - "{{ desired_mode in ['cool','heat'] }}"
+                      then:
+                        - service: climate.set_hvac_mode
+                          target:
+                            entity_id: "{{ ent }}"
+                          data:
+                            hvac_mode: "{{ desired_mode }}"
+                    - service: climate.set_temperature
+                      target:
+                        entity_id: "{{ ent }}"
+                      data:
+                        temperature: "{{ effective_target }}"
