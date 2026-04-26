@@ -169,6 +169,84 @@ blueprint:
           domain: sensor
           device_class: temperature
 
+    # ---------------- room sensors (optional) ----------------
+    room_temp_sensor:
+      name: Room temperature sensor (optional)
+      description: >
+        External temperature sensor (e.g. Netatmo indoor) used INSTEAD of
+        the climate entity's own `current_temperature`. Recommended on
+        Mitsubishi units whose return-air sensor is biased while running.
+        Applies to all entities in this instance.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+
+    humidity_sensor:
+      name: Indoor humidity sensor (optional)
+      description: >
+        Indoor relative humidity sensor (e.g. Netatmo). When present and
+        humidity is above the threshold while in cool mode, the unit will
+        run `dry` instead of `cool`.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+          device_class: humidity
+
+    humidity_dry_threshold:
+      name: Humidity threshold for dry mode (%)
+      description: >
+        If indoor humidity is at or above this value AND the chosen mode
+        is `cool`, switch to `dry` instead. Set 100 to disable.
+      default: 65
+      selector:
+        number:
+          min: 30
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+
+    # ---------------- weather forecast (optional) ----------------
+    weather_entity:
+      name: Weather entity (optional)
+      description: >
+        A `weather.*` entity (e.g. Met.no `weather.forecast_home`). When
+        configured, today's forecast HIGH/LOW are used to refine
+        `auto_season` decisions — so the system can choose cool early in
+        the morning before it actually gets hot, etc.
+      default: ""
+      selector:
+        entity:
+          domain: weather
+
+    forecast_hot_threshold:
+      name: Forecast high — hot day threshold (°C)
+      description: >
+        If today's forecast HIGH is at or above this value, treat the day
+        as "hot" for the autumn/spring season overrides (allowing cool).
+      default: 26
+      selector:
+        number:
+          min: 15
+          max: 40
+          step: 0.5
+          unit_of_measurement: "°C"
+
+    forecast_cold_threshold:
+      name: Forecast low — cold night threshold (°C)
+      description: >
+        If today's forecast LOW is at or below this value, treat the night
+        as "cold" for the spring/autumn season overrides (allowing heat).
+      default: 8
+      selector:
+        number:
+          min: -10
+          max: 20
+          step: 0.5
+          unit_of_measurement: "°C"
+
     # ---------------- schedule ----------------
     schedule_start:
       name: Schedule — start time
@@ -258,6 +336,12 @@ variables:
   min_runtime_minutes: !input min_runtime_minutes
   mode_strategy: !input mode_strategy
   outdoor_temp_sensor: !input outdoor_temp_sensor
+  room_temp_sensor: !input room_temp_sensor
+  humidity_sensor: !input humidity_sensor
+  humidity_dry_threshold: !input humidity_dry_threshold
+  weather_entity: !input weather_entity
+  forecast_hot_threshold: !input forecast_hot_threshold
+  forecast_cold_threshold: !input forecast_cold_threshold
   season_sensor: !input season_sensor
   season_hot_override: !input season_hot_override
   season_cold_override: !input season_cold_override
@@ -292,6 +376,13 @@ variables:
   outdoor_temp: >
     {% if outdoor_temp_sensor not in [none, ''] %}
       {{ states(outdoor_temp_sensor) | float(default=None) }}
+    {% else %}
+      None
+    {% endif %}
+
+  room_humidity: >
+    {% if humidity_sensor not in [none, ''] %}
+      {{ states(humidity_sensor) | float(default=None) }}
     {% else %}
       None
     {% endif %}
@@ -332,6 +423,42 @@ trigger:
 condition: []
 
 action:
+  # ------------------------------------------------------------------
+  # Fetch today's forecast once per tick (shared across all entities).
+  # ------------------------------------------------------------------
+  - if:
+      - "{{ weather_entity not in [none, ''] }}"
+    then:
+      - service: weather.get_forecasts
+        target:
+          entity_id: "{{ weather_entity }}"
+        data:
+          type: daily
+        response_variable: forecast_resp
+  - variables:
+      forecast_today: >
+        {% if weather_entity not in [none, ''] and forecast_resp is defined %}
+          {{ (forecast_resp[weather_entity].forecast | default([]))[0] | default(None) }}
+        {% else %}
+          None
+        {% endif %}
+      forecast_high: >
+        {% if forecast_today is mapping %}
+          {{ forecast_today.get('temperature') | float(default=None) }}
+        {% else %}
+          None
+        {% endif %}
+      forecast_low: >
+        {% if forecast_today is mapping %}
+          {{ forecast_today.get('templow') | float(default=None) }}
+        {% else %}
+          None
+        {% endif %}
+      forecast_hot_day: >
+        {{ forecast_high is not none and forecast_high >= forecast_hot_threshold }}
+      forecast_cold_night: >
+        {{ forecast_low is not none and forecast_low <= forecast_cold_threshold }}
+
   # ------------------------------------------------------------------
   # Hard OFF cases — applied to all entities.
   # Order matters: disabled > out-of-schedule.
@@ -384,7 +511,11 @@ action:
             - variables:
                 ent: "{{ repeat.item }}"
                 cur_temp: >
-                  {{ state_attr(ent, 'current_temperature') | float(default=None) }}
+                  {% if room_temp_sensor not in [none, ''] %}
+                    {{ states(room_temp_sensor) | float(default=None) }}
+                  {% else %}
+                    {{ state_attr(ent, 'current_temperature') | float(default=None) }}
+                  {% endif %}
                 hvac_mode: "{{ states(ent) }}"
                 last_changed_min: >
                   {% set lc = states[ent].last_changed if states[ent] else None %}
@@ -394,7 +525,7 @@ action:
                     9999
                   {% endif %}
                 # Decide desired direction (cool / heat) using the strategy.
-                desired_mode: >
+                base_mode: >
                   {% set t = target_base %}
                   {% set decide_temp = outdoor_temp if outdoor_temp is not none else cur_temp %}
                   {% if mode_strategy == 'cool_only' %}
@@ -411,15 +542,17 @@ action:
                     {% elif season in ['summer'] %}
                       cool
                     {% elif season in ['autumn','fall'] %}
-                      {# Heat by default; cool only on very hot days. #}
-                      {% if decide_temp is not none and decide_temp >= (t + season_hot_override) %}
+                      {# Heat by default; cool on very hot days OR forecast hot. #}
+                      {% set hot_now = decide_temp is not none and decide_temp >= (t + season_hot_override) %}
+                      {% if hot_now or forecast_hot_day %}
                         cool
                       {% else %}
                         heat
                       {% endif %}
                     {% elif season in ['spring'] %}
-                      {# Cool by default; heat only on very cold nights. #}
-                      {% if decide_temp is not none and decide_temp <= (t - season_cold_override) %}
+                      {# Cool by default; heat on very cold nights OR forecast cold. #}
+                      {% set cold_now = decide_temp is not none and decide_temp <= (t - season_cold_override) %}
+                      {% if cold_now or forecast_cold_night %}
                         heat
                       {% else %}
                         cool
@@ -439,10 +572,18 @@ action:
                       {{ 'cool' if cur_temp >= t else 'heat' }}
                     {% endif %}
                   {% endif %}
+                # Humidity override: if cooling and the room is muggy, use `dry`.
+                desired_mode: >
+                  {% set bm = base_mode | trim %}
+                  {% if bm == 'cool' and room_humidity is not none and room_humidity >= humidity_dry_threshold %}
+                    dry
+                  {% else %}
+                    {{ bm }}
+                  {% endif %}
                 effective_target: >
                   {% set t = target_base %}
                   {% if solar_exporting %}
-                    {% if desired_mode == 'cool' %}
+                    {% if desired_mode in ['cool','dry'] %}
                       {{ (t - solar_boost_offset) | round(1) }}
                     {% else %}
                       {{ (t + solar_boost_offset) | round(1) }}
@@ -453,7 +594,7 @@ action:
                 should_be_on: >
                   {% if cur_temp is none %}
                     false
-                  {% elif desired_mode == 'cool' %}
+                  {% elif desired_mode in ['cool','dry'] %}
                     {{ cur_temp > (effective_target + hysteresis) }}
                   {% elif desired_mode == 'heat' %}
                     {{ cur_temp < (effective_target - hysteresis) }}
@@ -463,7 +604,7 @@ action:
                 should_be_off: >
                   {% if cur_temp is none %}
                     false
-                  {% elif desired_mode == 'cool' %}
+                  {% elif desired_mode in ['cool','dry'] %}
                     {{ cur_temp < (effective_target - hysteresis) }}
                   {% elif desired_mode == 'heat' %}
                     {{ cur_temp > (effective_target + hysteresis) }}
@@ -530,7 +671,7 @@ action:
                     - if:
                         - "{{ mode_strategy != 'follow_climate' }}"
                         - "{{ hvac_mode != desired_mode }}"
-                        - "{{ desired_mode in ['cool','heat'] }}"
+                        - "{{ desired_mode in ['cool','heat','dry'] }}"
                       then:
                         - service: climate.set_hvac_mode
                           target:
