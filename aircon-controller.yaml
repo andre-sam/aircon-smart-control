@@ -14,10 +14,6 @@ blueprint:
         temperature vs. target.
       • Time-of-day schedule: only operates between `start_time` and
         `end_time`. Outside the window, units are turned off.
-      • Quiet hours: during this window, units stay in their current state
-        (no on/off transitions, but target setpoint is still maintained).
-      • Window / door open detection: pauses (turns off) any time the
-        provided binary_sensor group reports `on`.
       • Solar-aware: when the optional grid-export sensor indicates surplus
         export above a threshold, the effective target is shifted to
         pre-cool / pre-heat more aggressively (free energy).
@@ -30,11 +26,16 @@ blueprint:
     state changes.
 
 
+    Tip: to give different rooms different schedules (e.g. bedrooms run
+    overnight, living areas warm up from 05:00), instantiate this blueprint
+    once per group of rooms. Each instance gets its own entity list,
+    schedule, target helper and enable toggle, and they run independently.
+
+
     Required helpers (create these first):
       • input_boolean for the master enable toggle
       • input_number for the target temperature (recommended) OR pick a
         fixed value in the blueprint
-      • (optional) binary_sensor / group of window+door sensors
       • (optional) sensor for outdoor temperature
       • (optional) sensor for grid export power (negative when exporting,
         OR positive with the "positive_when_exporting" toggle)
@@ -102,6 +103,10 @@ blueprint:
         How to choose between cool and heat.
           • auto_indoor — pick `cool` if indoor > target, `heat` if indoor < target.
           • auto_outdoor — same, but use the outdoor temperature sensor.
+          • auto_season — use `sensor.season` (or custom season sensor) as the
+            primary hint: winter→heat, summer→cool, autumn→heat (cool on very
+            hot days), spring→cool (heat on very cold nights). Override
+            thresholds are configurable below.
           • cool_only — never heat.
           • heat_only — never cool.
           • follow_climate — leave whatever HVAC mode is set on the entity.
@@ -111,13 +116,53 @@ blueprint:
           options:
             - auto_indoor
             - auto_outdoor
+            - auto_season
             - cool_only
             - heat_only
             - follow_climate
 
+    season_sensor:
+      name: Season sensor (optional)
+      description: >
+        A sensor whose state is one of `winter`, `spring`, `summer`,
+        `autumn`/`fall`. Defaults to the built-in `sensor.season` from the
+        Season integration. Used only when `mode_strategy = auto_season`.
+      default: sensor.season
+      selector:
+        entity:
+          domain: sensor
+
+    season_hot_override:
+      name: Season — hot-day override (°C above target)
+      description: >
+        In autumn (or spring) when the deciding temperature is at least this
+        many °C above the target, switch to cooling instead of heating.
+      default: 4.0
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 0.5
+          unit_of_measurement: "°C"
+
+    season_cold_override:
+      name: Season — cold-night override (°C below target)
+      description: >
+        In spring (or autumn) when the deciding temperature is at least this
+        many °C below the target, switch to heating instead of cooling.
+      default: 4.0
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 0.5
+          unit_of_measurement: "°C"
+
     outdoor_temp_sensor:
       name: Outdoor temperature sensor (optional)
-      description: Required only if `mode_strategy = auto_outdoor`.
+      description: >
+        Used by `auto_outdoor`, and (when present) preferred over indoor
+        temperature for the season-override comparisons in `auto_season`.
       default: ""
       selector:
         entity:
@@ -140,35 +185,6 @@ blueprint:
       default: "23:00:00"
       selector:
         time: {}
-
-    # ---------------- quiet hours ----------------
-    quiet_start:
-      name: Quiet hours — start
-      description: >
-        During quiet hours the controller will not turn units ON or OFF
-        (it will still update the target temperature on units that are
-        already running). Set start = end to disable.
-      default: "22:00:00"
-      selector:
-        time: {}
-
-    quiet_end:
-      name: Quiet hours — end
-      default: "06:00:00"
-      selector:
-        time: {}
-
-    # ---------------- window / door pause ----------------
-    window_sensor:
-      name: Window / door open sensor (optional)
-      description: >
-        A `binary_sensor` (typically a group of window+door contacts). When
-        ON, all controlled units are turned OFF and held off until it is
-        OFF again. Leave empty to disable.
-      default: ""
-      selector:
-        entity:
-          domain: binary_sensor
 
     # ---------------- solar awareness ----------------
     solar_export_sensor:
@@ -242,11 +258,11 @@ variables:
   min_runtime_minutes: !input min_runtime_minutes
   mode_strategy: !input mode_strategy
   outdoor_temp_sensor: !input outdoor_temp_sensor
+  season_sensor: !input season_sensor
+  season_hot_override: !input season_hot_override
+  season_cold_override: !input season_cold_override
   schedule_start: !input schedule_start
   schedule_end: !input schedule_end
-  quiet_start: !input quiet_start
-  quiet_end: !input quiet_end
-  window_sensor: !input window_sensor
   solar_export_sensor: !input solar_export_sensor
   solar_positive_when_exporting: !input solar_positive_when_exporting
   solar_export_threshold: !input solar_export_threshold
@@ -273,26 +289,18 @@ variables:
       {{ n >= s or n < e }}
     {% endif %}
 
-  in_quiet: >
-    {% set s = quiet_start %}
-    {% set e = quiet_end %}
-    {% set n = now_t %}
-    {% if s == e %}
-      false
-    {% elif s < e %}
-      {{ s <= n < e }}
-    {% else %}
-      {{ n >= s or n < e }}
-    {% endif %}
-
-  window_open: >
-    {{ window_sensor not in [none, ''] and is_state(window_sensor, 'on') }}
-
   outdoor_temp: >
     {% if outdoor_temp_sensor not in [none, ''] %}
       {{ states(outdoor_temp_sensor) | float(default=None) }}
     {% else %}
       None
+    {% endif %}
+
+  season: >
+    {% if season_sensor not in [none, ''] %}
+      {{ states(season_sensor) | lower }}
+    {% else %}
+      unknown
     {% endif %}
 
   solar_exporting: >
@@ -325,31 +333,10 @@ condition: []
 
 action:
   # ------------------------------------------------------------------
-  # Hard OFF cases — applied to all entities, regardless of quiet hours.
-  # Order matters: window > disabled > out-of-schedule.
+  # Hard OFF cases — applied to all entities.
+  # Order matters: disabled > out-of-schedule.
   # ------------------------------------------------------------------
   - choose:
-      # Window/door open → force off
-      - conditions:
-          - "{{ window_open }}"
-        sequence:
-          - repeat:
-              for_each: "{{ climate_entities }}"
-              sequence:
-                - if:
-                    - "{{ not is_state(repeat.item, 'off') }}"
-                  then:
-                    - service: climate.turn_off
-                      target:
-                        entity_id: "{{ repeat.item }}"
-                    - if:
-                        - "{{ notify_service not in [none, ''] }}"
-                      then:
-                        - service: "{{ notify_service }}"
-                          data:
-                            message: >
-                              Aircon: turned off {{ repeat.item }} — window/door open.
-
       # Master toggle off → force off
       - conditions:
           - "{{ not enabled }}"
@@ -386,7 +373,7 @@ action:
                               Aircon: end of schedule — turned off {{ repeat.item }}.
 
     # ------------------------------------------------------------------
-    # Default branch: enabled + in-schedule + window closed.
+    # Default branch: enabled + in-schedule.
     # Per-entity decision: choose mode, compute effective target, decide
     # turn on / turn off / just adjust setpoint.
     # ------------------------------------------------------------------
@@ -409,6 +396,7 @@ action:
                 # Decide desired direction (cool / heat) using the strategy.
                 desired_mode: >
                   {% set t = target_base %}
+                  {% set decide_temp = outdoor_temp if outdoor_temp is not none else cur_temp %}
                   {% if mode_strategy == 'cool_only' %}
                     cool
                   {% elif mode_strategy == 'heat_only' %}
@@ -417,6 +405,33 @@ action:
                     {{ hvac_mode if hvac_mode in ['cool','heat','heat_cool','dry','fan_only'] else 'cool' }}
                   {% elif mode_strategy == 'auto_outdoor' and outdoor_temp is not none %}
                     {{ 'cool' if outdoor_temp >= t else 'heat' }}
+                  {% elif mode_strategy == 'auto_season' %}
+                    {% if season in ['winter'] %}
+                      heat
+                    {% elif season in ['summer'] %}
+                      cool
+                    {% elif season in ['autumn','fall'] %}
+                      {# Heat by default; cool only on very hot days. #}
+                      {% if decide_temp is not none and decide_temp >= (t + season_hot_override) %}
+                        cool
+                      {% else %}
+                        heat
+                      {% endif %}
+                    {% elif season in ['spring'] %}
+                      {# Cool by default; heat only on very cold nights. #}
+                      {% if decide_temp is not none and decide_temp <= (t - season_cold_override) %}
+                        heat
+                      {% else %}
+                        cool
+                      {% endif %}
+                    {% else %}
+                      {# Unknown season \u2192 fall back to indoor-temp logic. #}
+                      {% if cur_temp is none %}
+                        cool
+                      {% else %}
+                        {{ 'cool' if cur_temp >= t else 'heat' }}
+                      {% endif %}
+                    {% endif %}
                   {% else %}
                     {% if cur_temp is none %}
                       cool
@@ -463,11 +478,10 @@ action:
                     - "{{ cur_temp is none }}"
                   sequence: []
 
-                # Currently OFF and should turn ON — unless quiet hours.
+                # Currently OFF and should turn ON.
                 - conditions:
                     - "{{ not is_on }}"
                     - "{{ should_be_on }}"
-                    - "{{ not in_quiet }}"
                   sequence:
                     - service: climate.set_hvac_mode
                       target:
@@ -490,12 +504,10 @@ action:
                               (room {{ cur_temp }}°C, target {{ target_base }}°C
                               {% if solar_exporting %}, solar boost{% endif %}).
 
-                # Currently ON and should turn OFF — respecting min runtime
-                # and quiet hours.
+                # Currently ON and should turn OFF — respecting min runtime.
                 - conditions:
                     - "{{ is_on }}"
                     - "{{ should_be_off }}"
-                    - "{{ not in_quiet }}"
                     - "{{ last_changed_min >= min_runtime_minutes }}"
                   sequence:
                     - service: climate.turn_off
