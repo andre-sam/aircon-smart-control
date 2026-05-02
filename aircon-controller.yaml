@@ -16,7 +16,9 @@ blueprint:
         `end_time`. Outside the window, units are turned off.
       • Solar-aware: when the optional grid-export sensor indicates surplus
         export above a threshold, the effective target is shifted to
-        pre-cool / pre-heat more aggressively (free energy).
+        pre-cool / pre-heat more aggressively (free energy). Supports
+        hysteresis (separate start/resume thresholds) plus an optional
+        latch helper to prevent flapping on partly cloudy days.
       • Time-of-use tariff awareness: avoid starting (or even running)
         units during peak rate, with a smaller offset during shoulder.
         Solar surplus overrides the lockout.
@@ -333,11 +335,28 @@ blueprint:
       selector:
         boolean: {}
 
-    solar_export_threshold:
-      name: Solar export threshold (W)
+    solar_boost_start_threshold:
+      name: Solar boost START threshold (W)
       description: >
-        Minimum surplus export, in watts, before the "solar boost" target
-        offset is applied.
+        Minimum surplus export, in watts, required to START the solar
+        boost. Pair with `solar_boost_stop_threshold` (lower) to add
+        hysteresis and prevent flapping. Without a latch helper this
+        acts as a simple high-water mark.
+      default: 3000
+      selector:
+        number:
+          min: 0
+          max: 10000
+          step: 100
+          unit_of_measurement: "W"
+
+    solar_boost_stop_threshold:
+      name: Solar boost STOP threshold (W)
+      description: >
+        Surplus export below which the solar boost is dropped (only
+        meaningful when a latch helper is configured). Should be
+        LOWER than the start threshold — the gap between the two is
+        your hysteresis band. Without a latch helper this is ignored.
       default: 1500
       selector:
         number:
@@ -345,6 +364,20 @@ blueprint:
           max: 10000
           step: 100
           unit_of_measurement: "W"
+
+    solar_boost_state_helper:
+      name: Solar boost latch helper (optional)
+      description: >
+        An `input_boolean` used to remember whether the solar boost is
+        currently active. When configured, it enables true hysteresis:
+        the boost turns ON once export rises above the START threshold
+        and stays ON until export drops below the STOP threshold.
+        Without it, the controller falls back to a single-threshold
+        check (uses the START value).
+      default: ""
+      selector:
+        entity:
+          domain: input_boolean
 
     solar_boost_offset:
       name: Solar boost target offset (°C)
@@ -493,7 +526,9 @@ variables:
   schedule_end: !input schedule_end
   solar_export_sensor: !input solar_export_sensor
   solar_positive_when_exporting: !input solar_positive_when_exporting
-  solar_export_threshold: !input solar_export_threshold
+  solar_boost_start_threshold: !input solar_boost_start_threshold
+  solar_boost_stop_threshold: !input solar_boost_stop_threshold
+  solar_boost_state_helper: !input solar_boost_state_helper
   solar_boost_offset: !input solar_boost_offset
   tariff_sensor: !input tariff_sensor
   peak_start: !input peak_start
@@ -552,10 +587,21 @@ variables:
       false
     {% else %}
       {% set v = states(solar_export_sensor) | float(default=0) %}
-      {% if solar_positive_when_exporting %}
-        {{ v >= solar_export_threshold }}
+      {% set export_w = v if solar_positive_when_exporting else (-v) %}
+      {% set above_start = export_w >= solar_boost_start_threshold %}
+      {% set below_stop  = export_w <  solar_boost_stop_threshold %}
+      {% if solar_boost_state_helper not in [none, ''] %}
+        {# Latched hysteresis: stay ON until export drops below stop;
+           stay OFF until export rises above start. #}
+        {% if is_state(solar_boost_state_helper, 'on') %}
+          {{ not below_stop }}
+        {% else %}
+          {{ above_start }}
+        {% endif %}
       {% else %}
-        {{ (-v) >= solar_export_threshold }}
+        {# No latch helper → simple single-threshold check using the
+           START value (acts as a higher activation bar). #}
+        {{ above_start }}
       {% endif %}
     {% endif %}
 
@@ -648,6 +694,40 @@ action:
       forecast_cold_night: >
         {{ forecast_low is not none and forecast_low <= forecast_cold_threshold }}
 
+  # ------------------------------------------------------------------
+  # Maintain the solar-boost latch helper (if configured), so the
+  # `solar_exporting` flag has true hysteresis:
+  #   • flip ON once export rises above the START threshold;
+  #   • flip OFF once export drops below the STOP threshold;
+  #   • stay put while export is between the two.
+  # `solar_exporting` (in the variables block) reads the helper state,
+  # so updating the helper here means the *next* tick sees the new
+  # value — acceptable for a 1-minute control loop.
+  # ------------------------------------------------------------------
+  - if:
+      - "{{ solar_boost_state_helper not in [none, ''] }}"
+      - "{{ solar_export_sensor not in [none, ''] }}"
+      - "{{ solar_boost_offset != 0 }}"
+    then:
+      - variables:
+          _raw_export: "{{ states(solar_export_sensor) | float(default=0) }}"
+          _export_w: >
+            {{ _raw_export if solar_positive_when_exporting else (-_raw_export) }}
+      - choose:
+          - conditions:
+              - "{{ is_state(solar_boost_state_helper, 'off') }}"
+              - "{{ _export_w >= solar_boost_start_threshold }}"
+            sequence:
+              - service: input_boolean.turn_on
+                target:
+                  entity_id: "{{ solar_boost_state_helper }}"
+          - conditions:
+              - "{{ is_state(solar_boost_state_helper, 'on') }}"
+              - "{{ _export_w < solar_boost_stop_threshold }}"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ solar_boost_state_helper }}"
   # ------------------------------------------------------------------
   # Hard OFF cases — applied to all entities.
   # Order matters: disabled > out-of-schedule.
