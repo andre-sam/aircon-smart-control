@@ -733,7 +733,10 @@ action:
   # Order matters: disabled > out-of-schedule.
   # ------------------------------------------------------------------
   - choose:
-      # Master toggle off → force off
+      # Master toggle off → force off every controlled unit immediately.
+      # The `toggle` state trigger guarantees this branch runs the moment
+      # the input_boolean flips to off (in addition to the 1-minute tick),
+      # so units stop within a couple of seconds of the toggle change.
       - conditions:
           - "{{ not enabled }}"
         sequence:
@@ -746,6 +749,13 @@ action:
                     - service: climate.turn_off
                       target:
                         entity_id: "{{ repeat.item }}"
+                    - if:
+                        - "{{ notify_service not in [none, ''] }}"
+                      then:
+                        - service: "{{ notify_service }}"
+                          data:
+                            message: >
+                              Aircon: master toggle disabled — turned off {{ repeat.item }}.
 
       # Outside schedule → force off
       - conditions:
